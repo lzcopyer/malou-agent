@@ -4451,11 +4451,12 @@ class FeishuAdapter(BasePlatformAdapter):
     def _to_lark_md_content(text: str) -> str:
         """Convert markdown text to ``lark_md`` compatible content.
 
-        The card ``markdown`` element has limited rendering support in some
-        Feishu environments — bold (``**``) and inline code (`````) may not
-        render.  ``lark_md`` used inside ``div`` elements reliably supports
-        bold, italic, strikethrough, and links.  Inline code backticks are
-        preserved as literal characters (still visually distinct).
+        Deprecated: we now use the card ``markdown`` element directly, which
+        has been confirmed to render ``**bold**`` and ``*italic*`` correctly in
+        Feishu environments.  Kept for reference and potential future use.
+
+        ``lark_md`` used inside ``div`` elements was found to NOT render bold
+        or inline code in Feishu clients, despite documentation claims.
         """
         return text
 
@@ -4463,23 +4464,24 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_card_elements(content: str) -> List[Dict[str, Any]]:
         """Parse markdown content into a list of Feishu card elements.
 
-        Feishu's card ``markdown`` element has unreliable rendering for
-        bold and inline code in some environments.  All regular content
-        is rendered via ``div`` + ``lark_md`` which reliably supports
-        ``**bold**``, ``*italic*``, ``~~strikethrough~~``, and links.
+        Regular text content (including bold, italic, code) is rendered via
+        the card ``markdown`` element, which has been confirmed to render
+        ``**bold**`` formatting correctly in Feishu.  The ``div`` + ``lark_md``
+        approach was dropped because ``lark_md`` does NOT render bold or
+        inline code in Feishu clients.
 
         Structural conversions:
 
-        * ``## Heading`` → ``div`` with ``lark_md`` bold text
+        * ``## Heading`` → ``markdown`` element with ``**heading**``
         * ``|table|`` → native ``table`` element
         * ``---`` → ``hr`` element
-        * Everything else → ``div`` with ``lark_md`` text
+        * Everything else → ``markdown`` element
 
         Fenced code blocks are tracked so ``---`` and ``|...|`` inside them
         are preserved as literal text.
         """
         if not content or not content.strip():
-            return [{"tag": "div", "text": {"tag": "lark_md", "content": content or ""}}]
+            return [{"tag": "markdown", "content": content or ""}]
 
         elements: List[Dict[str, Any]] = []
         lines = content.splitlines()
@@ -4507,13 +4509,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     heading_text = m.group(2).strip()
                     if heading_text:
                         elements.append(
-                            {
-                                "tag": "div",
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": f"**{heading_text}**",
-                                },
-                            }
+                            {"tag": "markdown", "content": f"**{heading_text}**"}
                         )
                 i += 1
                 continue
@@ -4532,7 +4528,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     continue
                 # Fall through — treat as regular markdown
 
-            # ── Regular content (rendered via lark_md for reliable bold/italic) ──
+            # ── Regular content (rendered via markdown element) ──
             block_lines = []
             j = i
             while j < len(lines):
@@ -4556,17 +4552,11 @@ class FeishuAdapter(BasePlatformAdapter):
             if block_lines:
                 text = "\n".join(block_lines).strip()
                 if text:
-                    lark_text = FeishuAdapter._to_lark_md_content(text)
-                    elements.append(
-                        {
-                            "tag": "div",
-                            "text": {"tag": "lark_md", "content": lark_text},
-                        }
-                    )
+                    elements.append({"tag": "markdown", "content": text})
             i = j
 
         if not elements:
-            return [{"tag": "div", "text": {"tag": "lark_md", "content": content}}]
+            return [{"tag": "markdown", "content": content}]
         return elements
 
     async def _send_uploaded_file_message(
