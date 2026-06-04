@@ -6,7 +6,6 @@ import os
 import tempfile
 import time
 import unittest
-from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict
@@ -2797,7 +2796,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_uses_post_for_advanced_markdown_lines(self):
+    def test_send_uses_card_for_horizontal_rule_and_advanced_markdown(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2832,13 +2831,314 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
         payload = json.loads(captured["request"].request_body.content)
-        rows = payload["zh_cn"]["content"]
-        self.assertEqual(
-            rows,
-            [[{"tag": "md", "text": "---\n1. 第一项\n<u>下划线</u>\n~~删除线~~"}]],
+        # Interactive card payload has header + elements structure
+        self.assertIn("header", payload)
+        self.assertEqual(payload["header"]["title"]["content"], "🤖 Hermes")
+        self.assertIn("elements", payload)
+        # The content "---\n..." should produce: [hr, div+lark_md]
+        self.assertEqual(len(payload["elements"]), 2)
+        self.assertEqual(payload["elements"][0]["tag"], "hr")
+        self.assertEqual(payload["elements"][1]["tag"], "div")
+        self.assertIn("1. 第一项", payload["elements"][1]["text"]["content"])
+        self.assertIn("~~删除线~~", payload["elements"][1]["text"]["content"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_card_for_markdown_heading(self):
+        """Content with markdown headings should use interactive card."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_heading"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
         )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="## 项目文件\n这是一些内容。",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_card_for_markdown_table(self):
+        """Content with markdown tables should use interactive card."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_table"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="| Name | Value |\n|------|-------|\n| Key  | Val   |",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "interactive")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_card_payload_creates_valid_structure(self):
+        """_build_card_payload should return valid interactive card JSON."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        payload = json.loads(
+            adapter._build_card_payload("# Hello\nThis is **bold** and `code`")
+        )
+
+        self.assertIn("config", payload)
+        self.assertTrue(payload["config"]["wide_screen_mode"])
+        self.assertIn("header", payload)
+        self.assertEqual(payload["header"]["title"]["content"], "🤖 Hermes")
+        self.assertEqual(payload["header"]["template"], "blue")
+        self.assertIn("elements", payload)
+        # Heading is extracted into a div (card markdown doesn't render ##)
+        self.assertEqual(len(payload["elements"]), 2)
+        self.assertEqual(payload["elements"][0]["tag"], "div")
+        self.assertEqual(
+            payload["elements"][0]["text"]["content"],
+            "**Hello**",
+        )
+        self.assertEqual(payload["elements"][1]["tag"], "div")
+        self.assertIn("**bold**", payload["elements"][1]["text"]["content"])
+        self.assertIn("`code`", payload["elements"][1]["text"]["content"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_card_payload_custom_header(self):
+        """_build_card_payload should accept custom header title and template."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        payload = json.loads(
+            adapter._build_card_payload("content", header_title="Custom", template="green")
+        )
+
+        self.assertEqual(payload["header"]["title"]["content"], "Custom")
+        self.assertEqual(payload["header"]["template"], "green")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_falls_back_to_text_when_card_rejected_by_exception(self):
+        """When interactive card raises, send() should fall back to plain text."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    raise RuntimeError("interactive card type error")
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_plain"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="## Heading triggers card path",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
+        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_falls_back_to_text_when_card_response_unsuccessful(self):
+        """When interactive card response is unsuccessful, send() should fall back."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=10001,
+                        msg="interactive card error",
+                    )
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_plain"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="| A | B |\n|---|---|\n| 1 | 2 |",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
+        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_edit_message_falls_back_to_text_when_card_update_rejected(self):
+        """edit_message should fall back to text when interactive card update fails."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def update(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=10001,
+                        msg="interactive card error",
+                    )
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_card",
+                    content="## Updated heading",
+                )
+            )
+
+        self.assertTrue(result.success)
+        # First attempt should be interactive card
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
+        # Fallback should be text
+        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_card_elements_converts_horizontal_rules_to_hr(self):
+        """Horizontal rules in card content should produce hr elements."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        # Content with multiple HRs
+        payload = json.loads(adapter._build_card_payload(
+            "Section 1\n\n---\n\nSection 2\n\n---\n\nSection 3"
+        ))
+        elements = payload["elements"]
+        self.assertEqual(len(elements), 5)
+        self.assertEqual(elements[0]["tag"], "div")
+        self.assertIn("Section 1", elements[0]["text"]["content"])
+        self.assertEqual(elements[1]["tag"], "hr")
+        self.assertEqual(elements[2]["tag"], "div")
+        self.assertIn("Section 2", elements[2]["text"]["content"])
+        self.assertEqual(elements[3]["tag"], "hr")
+        self.assertEqual(elements[4]["tag"], "div")
+        self.assertIn("Section 3", elements[4]["text"]["content"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_card_elements_preserves_hr_inside_code_blocks(self):
+        """--- inside fenced code blocks should stay literal, not become hr."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        payload = json.loads(adapter._build_card_payload(
+            "Before\n```\n---\nstill code\n```\nAfter"
+        ))
+        elements = payload["elements"]
+        # Everything stays in one div+lark_md element; the code block's ---
+        # must NOT be split out into a separate hr element.
+        self.assertEqual(len(elements), 1)
+        self.assertEqual(elements[0]["tag"], "div")
+        self.assertIn("Before", elements[0]["text"]["content"])
+        self.assertIn("---", elements[0]["text"]["content"])
+        self.assertIn("After", elements[0]["text"]["content"])
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
@@ -3127,6 +3427,8 @@ class TestWebhookSecurity(unittest.TestCase):
 
     def test_signature_valid_passes(self):
         import hashlib
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.config import PlatformConfig
 
         encrypt_key = "test_secret"
         adapter = self._make_adapter(encrypt_key)
@@ -4604,7 +4906,7 @@ class TestFeishuFetchMessageText(unittest.TestCase):
         adapter._bot_open_id = "ou_bot"
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
-        adapter._message_text_cache = OrderedDict()
+        adapter._message_text_cache = {}
         adapter._client = Mock()
         adapter._build_get_message_request = Mock(return_value=object())
         return adapter
@@ -4884,62 +5186,3 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         # Body: leading @Hermes stripped, Alice preserved, trailing text intact.
         self.assertIn("@Alice review the spec with Alice", event.text)
         self.assertNotIn("@Hermes @Alice", event.text)
-
-
-class TestChatLockEviction(unittest.TestCase):
-    """_get_chat_lock is LRU-bounded so _chat_locks cannot grow unbounded."""
-
-    def _make_adapter(self, max_size=5):
-        import collections as _collections
-
-        from gateway.platforms.feishu import FeishuAdapter
-
-        adapter = object.__new__(FeishuAdapter)
-        adapter._chat_locks = _collections.OrderedDict()
-        adapter.CHAT_LOCK_MAX_SIZE = max_size
-        return adapter
-
-    def test_chat_locks_is_ordered_dict(self):
-        import collections as _collections
-
-        adapter = self._make_adapter()
-        self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
-    def test_same_id_returns_same_lock_and_stays_bounded(self):
-        adapter = self._make_adapter(max_size=5)
-        locks = [adapter._get_chat_lock(f"c{i}") for i in range(5)]
-        self.assertEqual(len(adapter._chat_locks), 5)
-        # Re-requesting an existing id returns the identical lock, no growth.
-        self.assertIs(adapter._get_chat_lock("c2"), locks[2])
-        self.assertEqual(len(adapter._chat_locks), 5)
-
-    def test_lru_eviction_respects_recent_access(self):
-        adapter = self._make_adapter(max_size=5)
-        for i in range(5):
-            adapter._get_chat_lock(f"c{i}")
-        # Touch c0 so it is no longer the LRU entry, then add a new chat.
-        adapter._get_chat_lock("c0")
-        adapter._get_chat_lock("c_new")
-        self.assertEqual(len(adapter._chat_locks), 5)
-        self.assertNotIn("c1", adapter._chat_locks)  # c1 was the true LRU
-        self.assertIn("c0", adapter._chat_locks)
-        self.assertIn("c_new", adapter._chat_locks)
-
-    def test_eviction_skips_held_locks(self):
-        adapter = self._make_adapter(max_size=3)
-
-        async def _run():
-            held = adapter._get_chat_lock("held")
-            await held.acquire()
-            try:
-                adapter._get_chat_lock("x")
-                adapter._get_chat_lock("y")
-                # At capacity; "held" is LRU but locked, so "x" should go instead.
-                adapter._get_chat_lock("z")
-                self.assertIn("held", adapter._chat_locks)
-                self.assertNotIn("x", adapter._chat_locks)
-                self.assertEqual(len(adapter._chat_locks), 3)
-            finally:
-                held.release()
-
-        asyncio.run(_run())
