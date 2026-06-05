@@ -4430,19 +4430,29 @@ class FeishuAdapter(BasePlatformAdapter):
             {
                 "name": col_names[i],
                 "display_name": header_cells[i] or "\u00a0",
-                "data_type": "text",
+                "data_type": "lark_md",      # v7.10+: bold, italic, links
                 "width": "auto",
             }
             for i in range(len(header_cells))
         ]
 
         # Rows are objects keyed by column name, e.g. {"c0": "val1", "c1": "val2"}
+        # ``data_type: lark_md`` supports **bold**, *italic*, ~~strikethrough~~,
+        # [links](url) — but NOT `` `inline code` ``.  Convert backtick-flavoured
+        # inline code to italic so cells don't show literal backticks.
+        _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+
+        def _adapt_cell_value(value: str) -> str:
+            """Convert unsupported markdown patterns to lark_md equivalents."""
+            #  `` `code` ``  →  `` *code* ``
+            return _INLINE_CODE_RE.sub(r"*\1*", value)
+
         table_rows: List[Dict[str, Any]] = []
         for row in data_rows:
             row_obj: Dict[str, Any] = {}
             for j in range(len(header_cells)):
                 value = row[j].strip() if j < len(row) else ""
-                row_obj[col_names[j]] = value or "\u00a0"
+                row_obj[col_names[j]] = _adapt_cell_value(value) or "\u00a0"
             table_rows.append(row_obj)
 
         return {"tag": "table", "columns": columns, "rows": table_rows}
@@ -4475,35 +4485,32 @@ class FeishuAdapter(BasePlatformAdapter):
         * ``## Heading`` → ``markdown`` element with ``**heading**``
         * ``|table|`` → native ``table`` element
         * ``---`` → ``hr`` element
+        * Fenced code blocks (`` ``` ``) → isolated ``markdown`` elements
         * Everything else → ``markdown`` element
 
-        Fenced code blocks are tracked so ``---`` and ``|...|`` inside them
-        are preserved as literal text.
+        Fenced code blocks are split into separate ``markdown`` elements
+        so the Feishu card renderer treats them cleanly.  Content inside
+        code blocks (``---``, ``|...|``) is preserved literally.
         """
         if not content or not content.strip():
             return [{"tag": "markdown", "content": content or ""}]
 
         elements: List[Dict[str, Any]] = []
         lines = content.splitlines()
-        in_code_block = False
         i = 0
 
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
 
-            # Track fenced code blocks
-            if stripped.startswith("```"):
-                in_code_block = not in_code_block
-
-            # ── Horizontal rule (outside code block) ──
-            if not in_code_block and _MARKDOWN_HR_RE.match(stripped):
+            # ── Horizontal rule ──
+            if _MARKDOWN_HR_RE.match(stripped):
                 elements.append({"tag": "hr"})
                 i += 1
                 continue
 
-            # ── Heading (outside code block) ──
-            if not in_code_block and _MARKDOWN_HEADING_RE.match(stripped):
+            # ── Heading ──
+            if _MARKDOWN_HEADING_RE.match(stripped):
                 m = re.match(r"^(#{1,6})\s+(.*)", stripped)
                 if m:
                     heading_text = m.group(2).strip()
@@ -4514,8 +4521,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 i += 1
                 continue
 
-            # ── Table detection (outside code block) ──
-            if not in_code_block and stripped.startswith("|"):
+            # ── Table detection ──
+            if stripped.startswith("|"):
                 table_lines = []
                 j = i
                 while j < len(lines) and lines[j].strip().startswith("|") and not lines[j].strip().startswith("```"):
@@ -4534,12 +4541,31 @@ class FeishuAdapter(BasePlatformAdapter):
             while j < len(lines):
                 s = lines[j].strip()
 
-                # Toggle code block state so | and --- inside fences are literal.
+                # ── Code block fence ── split code blocks into separate
+                # elements so the card markdown renderer treats them cleanly.
                 if s.startswith("```"):
-                    in_code_block = not in_code_block
+                    # Emit accumulated text before the fence.
+                    text = "\n".join(block_lines).strip()
+                    if text:
+                        elements.append({"tag": "markdown", "content": text})
+                        block_lines.clear()
 
-                # Stop at structural boundaries (only outside code blocks)
-                if not in_code_block and (
+                    # Collect the entire code block (fences included).
+                    code_block_lines = [lines[j]]
+                    j += 1
+                    while j < len(lines):
+                        code_block_lines.append(lines[j])
+                        if lines[j].strip().startswith("```"):
+                            j += 1  # consume closing fence
+                            break
+                        j += 1
+
+                    code_text = "\n".join(code_block_lines)
+                    elements.append({"tag": "markdown", "content": code_text})
+                    continue  # restart boundary checks from new j
+
+                # Stop at structural boundaries (headings, HR, tables).
+                if (
                     _MARKDOWN_HR_RE.match(s)
                     or _MARKDOWN_HEADING_RE.match(s)
                     or (s.startswith("|") and s.count("|") >= 2 and not s.startswith("|```"))

@@ -2837,12 +2837,12 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("header", payload)
         self.assertEqual(payload["header"]["title"]["content"], "🤖 Hermes")
         self.assertIn("elements", payload)
-        # The content "---\n..." should produce: [hr, div+lark_md]
+        # The content "---\n..." should produce: [hr, markdown]
         self.assertEqual(len(payload["elements"]), 2)
         self.assertEqual(payload["elements"][0]["tag"], "hr")
-        self.assertEqual(payload["elements"][1]["tag"], "div")
-        self.assertIn("1. 第一项", payload["elements"][1]["text"]["content"])
-        self.assertIn("~~删除线~~", payload["elements"][1]["text"]["content"])
+        self.assertEqual(payload["elements"][1]["tag"], "markdown")
+        self.assertIn("1. 第一项", payload["elements"][1]["content"])
+        self.assertIn("~~删除线~~", payload["elements"][1]["content"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_card_for_markdown_heading(self):
@@ -2939,16 +2939,16 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(payload["header"]["title"]["content"], "🤖 Hermes")
         self.assertEqual(payload["header"]["template"], "blue")
         self.assertIn("elements", payload)
-        # Heading is extracted into a div (card markdown doesn't render ##)
+        # Heading is extracted into a markdown element (card markdown renders **bold**)
         self.assertEqual(len(payload["elements"]), 2)
-        self.assertEqual(payload["elements"][0]["tag"], "div")
+        self.assertEqual(payload["elements"][0]["tag"], "markdown")
         self.assertEqual(
-            payload["elements"][0]["text"]["content"],
+            payload["elements"][0]["content"],
             "**Hello**",
         )
-        self.assertEqual(payload["elements"][1]["tag"], "div")
-        self.assertIn("**bold**", payload["elements"][1]["text"]["content"])
-        self.assertIn("`code`", payload["elements"][1]["text"]["content"])
+        self.assertEqual(payload["elements"][1]["tag"], "markdown")
+        self.assertIn("**bold**", payload["elements"][1]["content"])
+        self.assertIn("`code`", payload["elements"][1]["content"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_build_card_payload_custom_header(self):
@@ -3112,14 +3112,14 @@ class TestAdapterBehavior(unittest.TestCase):
         ))
         elements = payload["elements"]
         self.assertEqual(len(elements), 5)
-        self.assertEqual(elements[0]["tag"], "div")
-        self.assertIn("Section 1", elements[0]["text"]["content"])
+        self.assertEqual(elements[0]["tag"], "markdown")
+        self.assertIn("Section 1", elements[0]["content"])
         self.assertEqual(elements[1]["tag"], "hr")
-        self.assertEqual(elements[2]["tag"], "div")
-        self.assertIn("Section 2", elements[2]["text"]["content"])
+        self.assertEqual(elements[2]["tag"], "markdown")
+        self.assertIn("Section 2", elements[2]["content"])
         self.assertEqual(elements[3]["tag"], "hr")
-        self.assertEqual(elements[4]["tag"], "div")
-        self.assertIn("Section 3", elements[4]["text"]["content"])
+        self.assertEqual(elements[4]["tag"], "markdown")
+        self.assertIn("Section 3", elements[4]["content"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_build_card_elements_preserves_hr_inside_code_blocks(self):
@@ -3132,13 +3132,22 @@ class TestAdapterBehavior(unittest.TestCase):
             "Before\n```\n---\nstill code\n```\nAfter"
         ))
         elements = payload["elements"]
-        # Everything stays in one div+lark_md element; the code block's ---
-        # must NOT be split out into a separate hr element.
-        self.assertEqual(len(elements), 1)
-        self.assertEqual(elements[0]["tag"], "div")
-        self.assertIn("Before", elements[0]["text"]["content"])
-        self.assertIn("---", elements[0]["text"]["content"])
-        self.assertIn("After", elements[0]["text"]["content"])
+        # With the new code-block splitting, "Before", the code block, and "After"
+        # each become separate markdown elements. No hr elements should appear.
+        self.assertEqual(len(elements), 3)
+        for el in elements:
+            self.assertEqual(el["tag"], "markdown")
+        # "Before" section (pre-code-block text)
+        self.assertIn("Before", elements[0]["content"])
+        self.assertNotIn("```", elements[0]["content"])
+        # Code block: fences + content preserved, --- stays literal inside
+        self.assertIn("```", elements[1]["content"])
+        self.assertIn("---", elements[1]["content"])
+        self.assertIn("still code", elements[1]["content"])
+        self.assertNotIn("\"hr\"", json.dumps(payload["elements"]))
+        # "After" section (post-code-block text)
+        self.assertIn("After", elements[2]["content"])
+        self.assertNotIn("```", elements[2]["content"])
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
