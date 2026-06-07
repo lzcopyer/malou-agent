@@ -161,6 +161,9 @@ _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
 # Detect horizontal rules — post 'md' elements don't render these.
 _MARKDOWN_HR_RE = re.compile(r"^\s*---+$", re.MULTILINE)
+# Detect fenced code blocks — used by card-mode routing (matches OpenClaw shouldUseCard).
+# Schema 2.0 cards render code blocks natively; routes to _build_table_card_payload.
+_MARKDOWN_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
 # Card header template colours for different contexts.
 _CARD_TEMPLATE_BLUE = "blue"
 _CARD_TEMPLATE_GREY = "grey"
@@ -172,6 +175,28 @@ _DEFAULT_CARD_TITLE = "🤖 Hermes"
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
+
+# -- Schema 2.0 interactive card constants ---------------------------------
+
+# CardKit 2.0 caps the total number of GFM tables across an entire card at 5;
+# exceeding the limit triggers error 230099 / 11310.
+_FEISHU_CARD_TABLE_LIMIT = 5
+
+# Regex to find GFM tables *outside* fenced code blocks (code-block tables
+# are skipped because the Feishu markdown renderer treats them as code,
+# not as interactive table elements).
+_GFM_TABLE_OUTSIDE_CODE_RE = re.compile(
+    r"\|.+\|[\r\n]+\|[-:| ]+\|[\s\S]*?(?=\n\n|\n(?!\||$))"
+)
+
+# HTML-escape < > & in card markdown content to prevent Feishu from
+# mis-parsing them as HTML tags/entities inside schema 2.0 markdown elements.
+# Matches OpenClaw escapeFeishuCardMarkdownText.
+_CARD_MARKDOWN_ESCAPE_MAP = str.maketrans({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+})
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
@@ -552,6 +577,172 @@ def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -
 def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     parsed = _coerce_int(value, default=default, min_value=min_value)
     return default if parsed is None else parsed
+
+
+# ---------------------------------------------------------------------------
+# Schema 2.0 interactive card payload builders
+# ---------------------------------------------------------------------------
+
+
+def _escape_card_markdown(text: str) -> str:
+    """Escape & < > for safe embedding in Feishu card markdown elements."""
+    return text.translate(_CARD_MARKDOWN_ESCAPE_MAP)
+
+
+def _sanitise_card_text(
+    text: str,
+    table_limit: int = _FEISHU_CARD_TABLE_LIMIT,
+) -> str:
+    """Wrap GFM tables beyond *table_limit* inside fenced code blocks.
+
+    The first *table_limit* tables are left as-is for native rendering;
+    any extras are turned into `` ``` ... ``` `` code blocks to avoid
+    the 230099 / 11310 errors.
+    """
+    # Step 1 — locate code-block spans so we don't touch tables inside them.
+    code_ranges: list[tuple[int, int]] = []
+    for m in re.finditer(r"```[\s\S]*?```", text):
+        code_ranges.append((m.start(), m.end()))
+
+    def _inside_code(idx: int) -> bool:
+        return any(start <= idx < end for start, end in code_ranges)
+
+    # Step 2 — find GFM tables outside code blocks.
+    tables: list[re.Match[str]] = []
+    for m in _GFM_TABLE_OUTSIDE_CODE_RE.finditer(text):
+        if not _inside_code(m.start()):
+            tables.append(m)
+
+    if len(tables) <= table_limit:
+        return text
+
+    # Step 3 — replace extra tables with code blocks (right-to-left so
+    # earlier indices stay valid).
+    result = text
+    for m in reversed(tables[table_limit:]):
+        replacement = "```\n" + m.group(0).rstrip() + "\n```"
+        result = result[: m.start()] + replacement + result[m.end() :]
+
+    return result
+
+
+def _do_optimise_markdown(text: str) -> str:
+    """Pre-process markdown for Feishu Schema 2.0 rendering (ported from cc-haha).
+
+    1. Heading downgrade (H1→H4, H2+→H5) when H1-H3 are present.
+    2. <br> spacing around consecutive headings / tables / code blocks.
+    3. Blank-line compression (3+ → 2).
+    """
+    # 1. Protect fenced code blocks with placeholders
+    MARK = "___CB_"
+    code_blocks: list[str] = []
+    out = re.sub(
+        r"```[\s\S]*?```",
+        lambda m: f"{MARK}{code_blocks.append(m.group(0)) or len(code_blocks) - 1}___",
+        text,
+    )
+
+    # 2. Heading downgrade
+    if re.search(r"^#{1,3} ", text, re.MULTILINE):
+        out = re.sub(r"^#{2,6} (.+)$", r"##### \1", out, flags=re.MULTILINE)
+        out = re.sub(r"^# (.+)$", r"#### \1", out, flags=re.MULTILINE)
+
+    # 3. Schema 2.0 paragraph spacing
+    # 3a. Consecutive headings → <br>
+    out = re.sub(r"^(#{4,5} .+)\n{1,2}(#{4,5} )", r"\1\n<br>\n\2", out, flags=re.MULTILINE)
+
+    # 3b. Non-table line before table → add blank line
+    out = re.sub(r"^([^|\n].*)\n(\|.+\|)", r"\1\n\n\2", out, flags=re.MULTILINE)
+
+    # 3c. Insert <br> before table blocks
+    out = re.sub(r"\n\n((?:\|.+\|[^\S\n]*\n?)+)", r"\n\n<br>\n\n\1", out)
+
+    # 3d. Append <br> after table blocks (skip when followed by --- / heading / bold)
+    def _table_post_br(m: re.Match[str]) -> str:
+        after = out[m.end() :].lstrip("\n")
+        if not after or re.match(r"^(---|#{4,5} |\*\*)", after):
+            return m.group(0)
+        return m.group(0) + "\n<br>\n"
+
+    out = re.sub(r"((?:^\|.+\|[^\S\n]*\n?)+)", _table_post_br, out, flags=re.MULTILINE)
+
+    # 3e-g. Compact redundant <br> + blank-line combos
+    out = re.sub(
+        r"^((?!#{4,5} )(?!\*\*).+)\n\n(<br>)\n\n(\|)",
+        r"\1\n\2\n\3",
+        out,
+        flags=re.MULTILINE,
+    )
+    out = re.sub(
+        r"^(\*\*.+)\n\n(<br>)\n\n(\|)",
+        r"\1\n\2\n\n\3",
+        out,
+        flags=re.MULTILINE,
+    )
+    out = re.sub(
+        r"(\|[^\n]*\n)\n(<br>\n)((?!#{4,5} )(?!\*\*))",
+        r"\1\2\3",
+        out,
+        flags=re.MULTILINE,
+    )
+
+    # 4. Compress 3+ blank lines → 2
+    out = re.sub(r"\n{3,}", "\n\n", out)
+
+    # 5. Restore code blocks with <br> padding
+    for i, block in enumerate(code_blocks):
+        out = out.replace(f"{MARK}{i}___", f"\n<br>\n{block}\n<br>\n")
+
+    return out
+
+
+def _optimise_markdown_for_feishu(text: str) -> str:
+    """Pre-process markdown for Feishu Schema 2.0 rendering.
+
+    Ported from cc-haha ``optimizeMarkdownForFeishu``.  Applies:
+    1. Heading downgrade (H1→H4, H2+→H5) when H1-H3 are present.
+    2. ``<br>`` spacing around consecutive headings / tables / code blocks.
+    3. Blank-line compression (3+ → 2).
+    """
+    try:
+        return _do_optimise_markdown(text)
+    except Exception:
+        return text
+
+
+def _build_table_card_payload(content: str) -> str:
+    """Build a Feishu Schema 2.0 interactive card with a ``markdown`` element.
+
+    Schema 2.0's ``markdown`` element renders GFM tables, fenced code blocks,
+    blockquotes, and inline formatting natively (verified 2026-05-24).
+
+    The markdown is run through cc-haha's optimisation pipeline + HTML escaping
+    before being wrapped into the card JSON.
+    """
+    # Escape user content first, then optimise — optimisation adds <br> tags
+    # that must NOT be escaped.
+    escaped = _escape_card_markdown(content)
+    sanitised = _sanitise_card_text(escaped)
+    optimised = _optimise_markdown_for_feishu(sanitised)
+    return json.dumps(
+        {
+            "schema": "2.0",
+            "config": {
+                "update_multi": True,
+                "width_mode": "fill",
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": optimised or " ",
+                        "text_align": "left",
+                    }
+                ],
+            },
+        },
+        ensure_ascii=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4336,9 +4527,13 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Tables, headings, and horizontal rules don't render in post 'md' elements.
-        # Use interactive cards which support full markdown (headings, tables, rules, etc.).
-        if _MARKDOWN_TABLE_RE.search(content) or _MARKDOWN_HEADING_RE.search(content) or _MARKDOWN_HR_RE.search(content):
+        # GFM tables / fenced code blocks → interactive Schema 2.0 card.
+        # Schema 2.0's markdown element renders code blocks, tables, and
+        # inline formatting natively (verified against live Feishu API).
+        if _MARKDOWN_TABLE_RE.search(content) or _MARKDOWN_CODE_BLOCK_RE.search(content):
+            return "interactive", _build_table_card_payload(content)
+        # Headings and horizontal rules → original interactive card.
+        if _MARKDOWN_HEADING_RE.search(content) or _MARKDOWN_HR_RE.search(content):
             return "interactive", self._build_card_payload(content)
         if _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
